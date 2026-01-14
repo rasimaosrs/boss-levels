@@ -3,20 +3,29 @@ package com.bosslevels;
 import com.google.inject.Provides;
 import java.awt.Color;
 import java.awt.image.BufferedImage;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.EnumMap;
+import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
+import net.runelite.api.GameState;
 import net.runelite.api.Player;
 import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.gameval.SpotanimID;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.hiscore.HiscoreClient;
+import net.runelite.client.hiscore.HiscoreEndpoint;
+import net.runelite.client.hiscore.HiscoreResult;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.ClientToolbar;
@@ -35,12 +44,10 @@ public class BossLevelsPlugin extends Plugin
 	/* ===================== CONSTANTS ===================== */
 
 	private static final String CONFIG_GROUP = "bosslevels";
+
+	// In-game command output: "Your Abyssal Sire kill count is: 22."
 	private static final Pattern KC_PATTERN =
 			Pattern.compile("^Your (.+) kill count is: (\\d+)\\.$");
-	private static final Pattern RL_KC_PREFIX_PATTERN =
-			Pattern.compile("^(.+?):\\s*(.+?)\\s+kill count:\\s*(\\d+)\\s*$");
-	private static final Pattern RL_KC_BODY_PATTERN =
-			Pattern.compile("^(.+?)\\s+kill count:\\s*(\\d+)\\s*$");
 
 	/* ===================== INJECTED ===================== */
 
@@ -50,6 +57,10 @@ public class BossLevelsPlugin extends Plugin
 	@Inject private ClientToolbar clientToolbar;
 	@Inject private OverlayManager overlayManager;
 	@Inject private BossLevelsConfig config;
+
+	// Hiscores
+	@Inject private HiscoreClient hiscoreClient;
+	@Inject private ScheduledExecutorService executor;
 
 	@Provides
 	BossLevelsConfig provideConfig(ConfigManager configManager)
@@ -128,6 +139,23 @@ public class BossLevelsPlugin extends Plugin
 		panel = new BossLevelsPanel();
 		panel.setOpenBossDetailConsumer(this::openBossDetail);
 
+		// Button: pull hiscores
+		panel.setOnPullHiscores(() ->
+		{
+			clientThread.invoke(() ->
+					client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Boss Levels: Pulling hiscores…", null)
+			);
+
+			refreshAllBossKcFromHiscores(true);
+		});
+
+		panel.setCanPullHiscores(() -> client.getGameState() == GameState.LOGGED_IN);
+		if (!hiscoresPulledThisLogin)
+		{
+			hiscoresPulledThisLogin = true;
+			refreshAllBossKcFromHiscores(false); // silent auto pull
+		}
+
 		navButton = NavigationButton.builder()
 				.tooltip("Boss Levels")
 				.icon(pluginIcon)
@@ -165,58 +193,359 @@ public class BossLevelsPlugin extends Plugin
 		bossIcons16.clear();
 	}
 
+	/* ===================== AUTO HISCORES REFRESH ===================== */
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged e)
+	{
+		if (e.getGameState() == GameState.LOGGED_IN)
+		{
+			refreshAllBossKcFromHiscores(false);
+			hiscoresPulledThisLogin = false;
+		}
+	}
+
+	private void refreshAllBossKcFromHiscores(boolean showChat)
+	{
+		final Player p = client.getLocalPlayer();
+		if (p == null || p.getName() == null)
+		{
+			clientThread.invoke(() ->
+					client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Boss Levels: No player name available yet.", null)
+			);
+			return;
+		}
+
+		final String username = p.getName().trim();
+
+		executor.execute(() ->
+		{
+			HiscoreResult result = lookupHiscoresSafe(username);
+			if (result == null)
+			{
+				clientThread.invoke(() ->
+						client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Boss Levels: Hiscores lookup failed for " + username, null)
+				);
+				return;
+			}
+
+			clientThread.invoke(() ->
+			{
+				int updated = 0;
+				int mapped = 0;
+
+				for (BossDefinition def : BossDefinition.values())
+				{
+					Integer kc = tryGetBossKillCount(result, def);
+					if (kc == null)
+					{
+						continue;
+					}
+
+					mapped++;
+
+					if (kc >= 0)
+					{
+						// Silent absolute set so pulling doesn't spam drops/fireworks/chat line
+						if (setKcAbsolute(def, kc))
+						{
+							updated++;
+						}
+					}
+				}
+
+				if (panel != null)
+				{
+					SwingUtilities.invokeLater(() -> panel.rebuildOverview(bossXp, bossLevels, bossIcons16));
+				}
+
+				if (showChat)
+				{
+					client.addChatMessage(
+							ChatMessageType.GAMEMESSAGE,
+							"",
+							"Boss Levels: Hiscores pulled. Mapped=" + mapped + ", Updated=" + updated,
+							null
+					);
+				}
+			});
+		});
+
+	}
+
+	private HiscoreResult lookupHiscoresSafe(String username)
+	{
+		// Try every endpoint; works across normal/iron/group/seasonal depending on RL version.
+		for (HiscoreEndpoint ep : HiscoreEndpoint.values())
+		{
+			HiscoreResult r = tryLookup(username, ep);
+			if (r != null)
+			{
+				return r;
+			}
+		}
+		return null;
+	}
+
+	private HiscoreResult tryLookup(String username, HiscoreEndpoint endpoint)
+	{
+		try
+		{
+			return hiscoreClient.lookup(username, endpoint);
+		}
+		catch (Exception ignored)
+		{
+			return null;
+		}
+	}
+
+	/**
+	 * Absolute set of KC -> XP/Level, persisted, and lastKcSeen updated.
+	 * Returns true if state changed.
+	 */
+	private boolean setKcAbsolute(BossDefinition boss, int kc)
+	{
+		if (kc < 0)
+		{
+			return false;
+		}
+
+		Integer prev = lastKcSeen.getOrDefault(boss, -1);
+		if (prev == kc)
+		{
+			return false;
+		}
+
+		lastKcSeen.put(boss, kc);
+
+		long newXp = (long) kc * boss.xpPerKill;
+		int newLevel = levelForXp(newXp);
+
+		Long oldXp = bossXp.getOrDefault(boss, 0L);
+		Integer oldLevel = bossLevels.getOrDefault(boss, 1);
+
+		bossXp.put(boss, newXp);
+		bossLevels.put(boss, newLevel);
+		saveLong(xpKey(boss), newXp);
+
+		return oldXp != newXp || oldLevel != newLevel;
+	}
+
+	/* ===================== HISCORES BOSS KC LOOKUP ===================== */
+	private boolean hiscoresPulledThisLogin = false;
+
+	private Integer tryGetBossKillCount(HiscoreResult result, BossDefinition def)
+	{
+		if (result == null || def == null)
+		{
+			return null;
+		}
+
+		// Primary: match by enum constant name (your BossDefinition format matches this best)
+		String target = def.name();
+
+		// 1) Try any public methods like getBossKc/getBossScore that take an enum parameter
+		Integer viaMethods = tryExtractViaBossMethods(result, target);
+		if (viaMethods != null)
+		{
+			return viaMethods;
+		}
+
+		// 2) Generic fallback: scan any Map fields in HiscoreResult and match enum keys by name()
+		return tryExtractFromMapFields(result, target);
+	}
+
+	private Integer tryExtractViaBossMethods(HiscoreResult result, String targetEnumName)
+	{
+		try
+		{
+			for (Method m : result.getClass().getMethods())
+			{
+				String n = m.getName();
+				if (!n.equals("getBossKc") && !n.equals("getBossScore"))
+				{
+					continue;
+				}
+
+				Class<?>[] params = m.getParameterTypes();
+				if (params.length != 1 || !params[0].isEnum())
+				{
+					continue;
+				}
+
+				Object bossEnum = findEnumConstantByName(params[0], targetEnumName);
+				if (bossEnum == null)
+				{
+					continue;
+				}
+
+				Object out = m.invoke(result, bossEnum);
+
+				// getBossKc -> Integer
+				if (out instanceof Integer)
+				{
+					return (Integer) out;
+				}
+
+				// getBossScore -> some object; extract int
+				Integer kc = extractIntFromValue(out);
+				if (kc != null)
+				{
+					return kc;
+				}
+			}
+		}
+		catch (Exception ignored)
+		{
+		}
+
+		return null;
+	}
+
+	private Integer tryExtractFromMapFields(HiscoreResult result, String targetEnumName)
+	{
+		try
+		{
+			for (Field f : result.getClass().getDeclaredFields())
+			{
+				if (!Map.class.isAssignableFrom(f.getType()))
+				{
+					continue;
+				}
+
+				f.setAccessible(true);
+				Object mapObj = f.get(result);
+				if (!(mapObj instanceof Map))
+				{
+					continue;
+				}
+
+				Map<?, ?> map = (Map<?, ?>) mapObj;
+
+				for (Map.Entry<?, ?> e : map.entrySet())
+				{
+					Object key = e.getKey();
+					if (!(key instanceof Enum))
+					{
+						continue;
+					}
+
+					String keyName = ((Enum<?>) key).name();
+					if (!keyName.equalsIgnoreCase(targetEnumName))
+					{
+						// extra tolerance: spaces/underscores differences
+						String kn = keyName.replace('_', ' ').toUpperCase(Locale.ROOT);
+						String tn = targetEnumName.replace('_', ' ').toUpperCase(Locale.ROOT);
+						if (!kn.equals(tn))
+						{
+							continue;
+						}
+					}
+
+					Integer kc = extractIntFromValue(e.getValue());
+					if (kc != null)
+					{
+						return kc;
+					}
+				}
+			}
+		}
+		catch (Exception ignored)
+		{
+		}
+
+		return null;
+	}
+
+	private Object findEnumConstantByName(Class<?> enumClass, String name)
+	{
+		try
+		{
+			Object[] constants = enumClass.getEnumConstants();
+			if (constants == null)
+			{
+				return null;
+			}
+
+			for (Object c : constants)
+			{
+				if (c instanceof Enum && ((Enum<?>) c).name().equalsIgnoreCase(name))
+				{
+					return c;
+				}
+			}
+		}
+		catch (Exception ignored)
+		{
+		}
+
+		return null;
+	}
+
+	/**
+	 * Extracts an int KC from various RL hiscore value types.
+	 * Handles Integer directly and common getter names used by different RL versions.
+	 */
+	private Integer extractIntFromValue(Object value)
+	{
+		if (value == null)
+		{
+			return null;
+		}
+
+		if (value instanceof Integer)
+		{
+			return (Integer) value;
+		}
+
+		// Common RL hiscore score containers
+		String[] methodNames = {"getKillCount", "getKc", "getLevel", "getScore", "getValue"};
+
+		for (String mn : methodNames)
+		{
+			try
+			{
+				Method m = value.getClass().getMethod(mn);
+				Object out = m.invoke(value);
+				if (out instanceof Integer)
+				{
+					return (Integer) out;
+				}
+			}
+			catch (Exception ignored)
+			{
+			}
+		}
+
+		return null;
+	}
 	/* ===================== CHAT HANDLER ===================== */
 
 	@Subscribe
 	@SuppressWarnings("unused")
 	public void onChatMessage(ChatMessage event)
 	{
-		// Avoid ChatMessageType mismatches
+		if (event.getType() != ChatMessageType.GAMEMESSAGE)
+		{
+			return;
+		}
+
 		final String msg = Text.removeTags(event.getMessage()).trim();
+
+		// In-game ::kc format: "Your X kill count is: N."
 		Matcher m = KC_PATTERN.matcher(msg);
-		if (m.matches())
-		{
-			BossDefinition boss = findBossByKcName(m.group(1));
-			if (boss != null)
-			{
-				applyKcUpdate(boss, Integer.parseInt(m.group(2)));
-			}
-			return;
-		}
-
-		m = RL_KC_PREFIX_PATTERN.matcher(msg);
-		if (m.matches())
-		{
-			if (!isLocalPlayerName(m.group(1)))
-			{
-				return;
-			}
-
-			BossDefinition boss = findBossByKcName(m.group(2));
-			if (boss != null)
-			{
-				applyKcUpdate(boss, Integer.parseInt(m.group(3)));
-			}
-			return;
-		}
-
-		m = RL_KC_BODY_PATTERN.matcher(msg);
 		if (!m.matches())
 		{
 			return;
 		}
 
-		final String senderFromEvent = Text.removeTags(event.getName()).trim();
-		if (!isLocalPlayerName(senderFromEvent))
+		BossDefinition boss = findBossByKcName(m.group(1));
+		if (boss == null)
 		{
 			return;
 		}
 
-		BossDefinition boss = findBossByKcName(m.group(1));
-		if (boss != null)
-		{
-			applyKcUpdate(boss, Integer.parseInt(m.group(2)));
-		}
+		applyKcUpdate(boss, Integer.parseInt(m.group(2)));
 	}
 
 	private void applyKcUpdate(BossDefinition boss, int kc)
@@ -275,16 +604,6 @@ public class BossLevelsPlugin extends Plugin
 		{
 			playLevelUpFireworks(newLevel);
 		}
-	}
-
-	private boolean isLocalPlayerName(String sender)
-	{
-		Player p = client.getLocalPlayer();
-		if (p == null || p.getName() == null)
-		{
-			return false;
-		}
-		return p.getName().trim().equalsIgnoreCase(sender.trim());
 	}
 
 	/* ===================== FIREWORKS ===================== */

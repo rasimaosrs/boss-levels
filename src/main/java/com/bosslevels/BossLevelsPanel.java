@@ -14,6 +14,7 @@ import java.awt.event.MouseEvent;
 import java.awt.image.BufferedImage;
 import java.text.NumberFormat;
 import java.util.Map;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
@@ -21,6 +22,7 @@ import javax.swing.BoxLayout;
 import javax.swing.ImageIcon;
 import javax.swing.JButton;
 import javax.swing.JLabel;
+import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JTextArea;
@@ -36,6 +38,11 @@ public class BossLevelsPanel extends PluginPanel
     // Overview (grid)
     private final JPanel grid = new JPanel();
     private final JScrollPane gridScroll;
+
+    // NEW: Pull hiscores
+    private final JButton hiscoresButton = new JButton("Pull hiscores data");
+    private Runnable onPullHiscores = () -> {};
+    private BooleanSupplier canPullHiscores = () -> true;
 
     // Detail
     private final JPanel detail = new JPanel(new BorderLayout());
@@ -56,12 +63,27 @@ public class BossLevelsPanel extends PluginPanel
         add(root, BorderLayout.CENTER);
 
         /* ---------- Overview card ---------- */
-        grid.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
         grid.setLayout(new GridLayout(0, 3, 18, 18));
 
         JPanel gridWrapper = new JPanel(new BorderLayout());
         gridWrapper.setOpaque(false);
-        gridWrapper.add(grid, BorderLayout.NORTH); // pin grid to top
+
+        // Top bar with hiscores button
+        JPanel topBar = new JPanel();
+        topBar.setOpaque(false);
+        topBar.setLayout(new BoxLayout(topBar, BoxLayout.X_AXIS));
+        topBar.add(hiscoresButton);
+        topBar.add(Box.createHorizontalGlue());
+        topBar.setBorder(BorderFactory.createEmptyBorder(0, 0, 10, 0));
+
+        JPanel container = new JPanel(new BorderLayout());
+        container.setOpaque(false);
+        container.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        container.add(topBar, BorderLayout.NORTH);
+        container.add(grid, BorderLayout.CENTER);
+
+        // Pin content to top of the scrollpane
+        gridWrapper.add(container, BorderLayout.NORTH);
 
         gridScroll = new JScrollPane(gridWrapper);
         gridScroll.setBorder(null);
@@ -117,7 +139,36 @@ public class BossLevelsPanel extends PluginPanel
         root.add(detail, "detail");
 
         backButton.addActionListener(e -> showOverview());
+
+        hiscoresButton.addActionListener(e ->
+        {
+            if (!canPullHiscores.getAsBoolean())
+            {
+                JOptionPane.showMessageDialog(
+                        this,
+                        "Hiscores pull is unavailable right now.",
+                        "Boss Levels",
+                        JOptionPane.INFORMATION_MESSAGE
+                );
+                return;
+            }
+            onPullHiscores.run();
+        });
+
         showOverview();
+    }
+
+    /**
+     * Plugin hooks for the "Pull hiscores data" button.
+     */
+    public void setOnPullHiscores(Runnable r)
+    {
+        this.onPullHiscores = (r != null) ? r : () -> {};
+    }
+
+    public void setCanPullHiscores(BooleanSupplier s)
+    {
+        this.canPullHiscores = (s != null) ? s : () -> true;
     }
     public void setOpenBossDetailConsumer(Consumer<BossDefinition> onBossClicked)
     {
@@ -171,6 +222,10 @@ public class BossLevelsPanel extends PluginPanel
 
         cardLayout.show(root, "detail");
     }
+
+    /**
+     * Rebuilds the overview grid.
+     */
     public void rebuildOverview(
             Map<BossDefinition, Long> xpMap,
             Map<BossDefinition, Integer> levelMap,
@@ -179,6 +234,10 @@ public class BossLevelsPanel extends PluginPanel
     {
         rebuildOverview(xpMap, levelMap, iconMap, onBossClicked);
     }
+
+    /**
+     * Rebuilds the overview grid.
+     */
     public void rebuildOverview(
             Map<BossDefinition, Long> xpMap,
             Map<BossDefinition, Integer> levelMap,

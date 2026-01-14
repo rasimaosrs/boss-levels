@@ -1456,23 +1456,75 @@ public enum BossDefinition
     ),
     ;
 
-
-
-
-
     public final String kcName;
+
+    /**
+     * Name to use when reading from RuneLite hiscores APIs.
+     * Defaults to kcName unless overridden via constructor.
+     */
+    public final String hiscoreName;
+
     public final String configKey;
     public final int xpPerKill;
     public final String iconFile;
     public final List<String> milestones;
 
-    BossDefinition(String kcName, String configKey, int xpPerKill, String iconFile, List<String> milestones)
+    /**
+     * Optional aliases (e.g., abbreviations like "kbd", "kq", etc.).
+     * No constants need to be updated; this defaults to empty.
+     */
+    public final String[] aliases;
+
+    /**
+     * Backwards-compatible constructor (all your current enum constants use this).
+     * aliases is optional (varargs) so existing constants do not need changes.
+     */
+    BossDefinition(String kcName, String configKey, int xpPerKill, String iconFile, List<String> milestones, String... aliases)
+    {
+        this(kcName, kcName, configKey, xpPerKill, iconFile, milestones, aliases);
+    }
+
+    /**
+     * Optional constructor if you ever need the hiscore name to differ from kcName.
+     * Example usage:
+     * SOME_BOSS("KC Name", "Hiscore Name", "config_key", 500, "icon.png", milestones)
+     */
+    BossDefinition(String kcName, String hiscoreName, String configKey, int xpPerKill, String iconFile, List<String> milestones, String... aliases)
     {
         this.kcName = kcName;
+        this.hiscoreName = (hiscoreName == null || hiscoreName.trim().isEmpty()) ? kcName : hiscoreName;
         this.configKey = configKey;
         this.xpPerKill = xpPerKill;
         this.iconFile = iconFile;
         this.milestones = milestones;
+        this.aliases = (aliases == null) ? new String[0] : aliases;
+    }
+
+    /**
+     * Helper: matches a provided name against kcName, hiscoreName, or aliases (case-insensitive).
+     */
+    public boolean matchesName(String name)
+    {
+        if (name == null)
+        {
+            return false;
+        }
+
+        String n = name.trim();
+        if (n.equalsIgnoreCase(kcName) || n.equalsIgnoreCase(hiscoreName))
+        {
+            return true;
+        }
+
+        for (String a : aliases)
+        {
+            if (a != null && n.equalsIgnoreCase(a.trim()))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 }
 
